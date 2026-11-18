@@ -1,0 +1,13 @@
+node_modules/
+.next/
+data/session.secret
+data/gemini.test
+data/*.json
+data/desks/
+data/*.log
+data/voice-cache/
+data/*.lock
+data/*.tmp
+certificates/
+storage/images/*
+!storage/images/.gitkeep
