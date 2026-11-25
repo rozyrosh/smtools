@@ -198,10 +198,16 @@ export async function login(email: string, password: string) {
     await new Promise((resolve) => setTimeout(resolve, 40));
     found = readAll().find((account) => String(account.email || "").toLowerCase() === cleanEmail);
   }
-  const hash = found?.password_hash || "";
+  if (!found) {
+    throw new DeskError("No account with that email on this site. Use Get Started to create one here.");
+  }
+  const hash = String(found.password_hash || "");
   const normalized = hash.replace(/^\$2y\$/, "$2b$");
-  const ok = !!found && !!hash && bcrypt.compareSync(typed, normalized);
-  if (!ok || !found) throw new DeskError("That email or password does not match.");
+  if (!normalized || normalized.length < 20) {
+    throw new DeskError("That account has no usable password saved. Create a new account with Get Started.");
+  }
+  const ok = bcrypt.compareSync(typed, normalized);
+  if (!ok) throw new DeskError("That email or password does not match.");
   if (found.disabled) throw new DeskError("This account is paused. Ask the admin to open it again.");
   const user = publicUser(found);
   await enter(user.id);
