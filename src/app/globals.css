@@ -19,6 +19,9 @@
   --wash: #f3e8ff;
   --clay: #c2413b;
   --shadow: 0 24px 60px rgba(26, 16, 48, 0.12);
+  --font-sans: "Plus Jakarta Sans";
+  --font-display: "Plus Jakarta Sans";
+  --font-reading: Georgia;
   color: var(--ink);
   background: var(--canvas);
   font-family: var(--font-sans), "Segoe UI", sans-serif;
