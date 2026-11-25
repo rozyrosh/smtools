@@ -4,11 +4,26 @@ import { dataDir } from "@/server/paths";
 
 export const dynamic = "force-dynamic";
 
-function accountSummary(dir: string) {
+type AccountSummary = {
+  accounts_file: boolean;
+  account_count: number;
+  emails: string[];
+  passwords_saved: number;
+  parse_error: string | null;
+  bytes: number;
+};
+
+function accountSummary(dir: string): AccountSummary {
+  const empty: AccountSummary = {
+    accounts_file: false,
+    account_count: 0,
+    emails: [],
+    passwords_saved: 0,
+    parse_error: null,
+    bytes: 0,
+  };
   const file = path.join(dir, "accounts.json");
-  if (!existsSync(file)) {
-    return { accounts_file: false, account_count: 0, emails: [] as string[], parse_error: null as string | null };
-  }
+  if (!existsSync(file)) return empty;
   try {
     const raw = readFileSync(file, "utf8");
     const data = JSON.parse(raw);
@@ -22,14 +37,14 @@ function accountSummary(dir: string) {
       account_count: rows.length,
       emails,
       passwords_saved: withHash,
-      parse_error: null as string | null,
+      parse_error: null,
       bytes: raw.length,
     };
   } catch (err) {
     return {
       accounts_file: true,
       account_count: 0,
-      emails: [] as string[],
+      emails: [],
       passwords_saved: 0,
       parse_error: err instanceof Error ? err.message : "accounts.json could not be read",
       bytes: 0,
@@ -41,14 +56,7 @@ export async function GET() {
   let dir = "";
   let writable = false;
   let error = "";
-  let accounts = {
-    accounts_file: false,
-    account_count: 0,
-    emails: [] as string[],
-    passwords_saved: 0,
-    parse_error: null as string | null,
-    bytes: 0,
-  };
+  let accounts = accountSummary("");
   try {
     dir = dataDir();
     const probe = path.join(dir, `.health-${process.pid}`);
