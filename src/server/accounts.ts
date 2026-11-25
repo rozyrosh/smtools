@@ -52,6 +52,7 @@ function applyBootstrap(accounts: Account[]) {
     const name = limitText(String(spec.name || "Admin"), 60);
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || pass.length < 8) return accounts;
     let account = accounts.find((item) => item.email.toLowerCase() === email);
+    let changed = false;
     if (!account) {
       const id = randomId("usr");
       mkdirSync(path.join(dataDir(), "desks", id), { recursive: true });
@@ -68,43 +69,59 @@ function applyBootstrap(accounts: Account[]) {
         created_at: new Date().toISOString(),
       };
       accounts.push(account);
-    } else {
+      changed = true;
+    } else if (!account.admin || account.disabled) {
+      // Never reset an existing password on later reads — that caused intermittent logins.
       account.admin = true;
       account.disabled = false;
-      account.password_hash = bcrypt.hashSync(pass, 10);
+      changed = true;
     }
-    writeAll(accounts);
-    unlinkSync(file);
+    if (changed) writeAll(accounts);
+    try {
+      unlinkSync(file);
+    } catch {
+      /* deploy folder may be read-only; ignore */
+    }
   } catch {
     return accounts;
   }
   return accounts;
 }
 
+function parseAccountsFile(file: string): Account[] | null {
+  if (!existsSync(file)) return null;
+  try {
+    const data = JSON.parse(readFileSync(file, "utf8"));
+    if (!Array.isArray(data)) return null;
+    return data.filter((item) => item && typeof item === "object") as Account[];
+  } catch {
+    return null;
+  }
+}
+
 function readAll(): Account[] {
-  let accounts: Account[] = [];
-  if (existsSync(accountsFile())) {
-    try {
-      const data = JSON.parse(readFileSync(accountsFile(), "utf8"));
-      accounts = Array.isArray(data) ? data.filter((item) => item && typeof item === "object") : [];
-    } catch {
-      accounts = [];
-    }
+  let accounts = parseAccountsFile(accountsFile());
+  // During an atomic replace the main file can be briefly unreadable — retry / use tmp.
+  if (!accounts) {
+    accounts = parseAccountsFile(`${accountsFile()}.tmp`) || [];
   }
   accounts = applyBootstrap(accounts);
   if (accounts.length && !accounts.some((account) => account.admin)) {
     const oldest = [...accounts].sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")))[0];
-    oldest.admin = true;
-    writeAll(accounts);
+    if (oldest && !oldest.admin) {
+      oldest.admin = true;
+      writeAll(accounts);
+    }
   }
   return accounts;
 }
 
 function writeAll(accounts: Account[]) {
   const file = accountsFile();
-  const tmp = `${file}.tmp`;
+  mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(tmp, JSON.stringify(accounts, null, 2));
-  if (existsSync(file)) unlinkSync(file);
+  // Atomic replace on Linux — do not unlink first (that caused intermittent empty reads / failed logins).
   renameSync(tmp, file);
 }
 
@@ -174,10 +191,16 @@ export async function register(name: string, email: string, password: string) {
 
 export async function login(email: string, password: string) {
   const cleanEmail = email.trim().toLowerCase();
-  const found = readAll().find((account) => account.email.toLowerCase() === cleanEmail);
+  const typed = String(password ?? "");
+  let found = readAll().find((account) => String(account.email || "").toLowerCase() === cleanEmail);
+  // One retry covers a rare mid-write read of accounts.json on Hostinger.
+  if (!found) {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    found = readAll().find((account) => String(account.email || "").toLowerCase() === cleanEmail);
+  }
   const hash = found?.password_hash || "";
   const normalized = hash.replace(/^\$2y\$/, "$2b$");
-  const ok = !!found && !!hash && bcrypt.compareSync(password, normalized);
+  const ok = !!found && !!hash && bcrypt.compareSync(typed, normalized);
   if (!ok || !found) throw new DeskError("That email or password does not match.");
   if (found.disabled) throw new DeskError("This account is paused. Ask the admin to open it again.");
   const user = publicUser(found);

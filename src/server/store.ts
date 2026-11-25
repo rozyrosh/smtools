@@ -250,9 +250,9 @@ function writeJson(file: string, data: unknown) {
   try {
     mkdirSync(path.dirname(file), { recursive: true });
     const json = JSON.stringify(data, null, 2);
-    const tmp = `${file}.tmp`;
+    const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
     writeFileSync(tmp, json);
-    if (existsSync(file)) unlinkSync(file);
+    // Atomic replace — never unlink the live file first (race caused intermittent login failures).
     renameSync(tmp, file);
   } catch (error) {
     const code = error && typeof error === "object" && "code" in error ? String((error as { code?: string }).code || "") : "";
