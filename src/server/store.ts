@@ -247,11 +247,23 @@ function readJson<T>(file: string, fallback: T): T {
 }
 
 function writeJson(file: string, data: unknown) {
-  const json = JSON.stringify(data, null, 2);
-  const tmp = `${file}.tmp`;
-  writeFileSync(tmp, json);
-  if (existsSync(file)) unlinkSync(file);
-  renameSync(tmp, file);
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    const json = JSON.stringify(data, null, 2);
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, json);
+    if (existsSync(file)) unlinkSync(file);
+    renameSync(tmp, file);
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String((error as { code?: string }).code || "") : "";
+    if (code === "EACCES" || code === "EROFS" || code === "EPERM") {
+      throw new DeskError(
+        "This server cannot save data. Set DATA_DIR in Hostinger environment variables to a writable folder, then redeploy.",
+        500
+      );
+    }
+    throw error;
+  }
 }
 
 export function readSettings(): Settings {

@@ -1,20 +1,76 @@
 import { randomBytes } from "crypto";
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { homedir } from "os";
 import path from "path";
 
 export const GRAPH_VERSION = "v23.0";
 export const STUDIO_ENV = "C:/xampp/htdocs/sinhala_studio/.env";
 
+/** Hostinger rebuilds wipe the app folder — keep data outside versions/nodejs. */
 function hostingerKeep() {
-  const cwd = process.cwd();
-  const marker = `${path.sep}hbuilds${path.sep}versions${path.sep}`;
-  const at = cwd.indexOf(marker);
-  if (at < 0) return "";
-  return path.join(cwd.slice(0, at), "smtools-data");
+  const cwd = process.cwd().replace(/\//g, path.sep);
+  const versionsMarker = `${path.sep}hbuilds${path.sep}versions${path.sep}`;
+  const versionsAt = cwd.indexOf(versionsMarker);
+  if (versionsAt >= 0) {
+    return path.join(cwd.slice(0, versionsAt), "smtools-data");
+  }
+  const hbuildsMarker = `${path.sep}hbuilds${path.sep}`;
+  const hbuildsAt = cwd.indexOf(hbuildsMarker);
+  if (hbuildsAt >= 0) {
+    return path.join(cwd.slice(0, hbuildsAt), "smtools-data");
+  }
+  // Git Node apps often run under .../domains/<site>/... — keep data next to domains root.
+  const domainsMarker = `${path.sep}domains${path.sep}`;
+  const domainsAt = cwd.indexOf(domainsMarker);
+  if (domainsAt >= 0) {
+    const after = cwd.slice(domainsAt + domainsMarker.length);
+    const site = after.split(path.sep)[0] || "site";
+    return path.join(cwd.slice(0, domainsAt), "domains", site, "smtools-data");
+  }
+  return "";
+}
+
+function canWrite(dir: string) {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, `.smtools-write-${process.pid}`);
+    writeFileSync(probe, "ok");
+    unlinkSync(probe);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveDataRoot() {
+  const home = (() => {
+    try {
+      return homedir();
+    } catch {
+      return process.env.HOME || process.env.USERPROFILE || "";
+    }
+  })();
+  const candidates = [
+    process.env["DATA_DIR"]?.trim() || "",
+    hostingerKeep(),
+    home ? path.join(home, "smtools-data") : "",
+    path.join(process.cwd(), "data"),
+  ].filter(Boolean);
+
+  for (const dir of candidates) {
+    if (canWrite(dir)) return dir;
+  }
+  throw new DeskError(
+    "This server cannot save account data. In Hostinger → Environment variables, set DATA_DIR to a writable folder (for example /home/YOUR_USER/smtools-data), then redeploy.",
+    500
+  );
 }
 
 function useDir(dir: string) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  if (!canWrite(dir)) {
+    throw new DeskError(`Cannot write to data folder: ${dir}`, 500);
+  }
   return dir;
 }
 
@@ -71,11 +127,26 @@ function writeRecovered(dir: string, best: { raw: Record<string, unknown>; from:
 }
 
 let announced = false;
+let cachedRoot = "";
+
+function dataRoot() {
+  if (!cachedRoot) cachedRoot = resolveDataRoot();
+  return cachedRoot;
+}
+
+function isPersistentRoot(dir: string) {
+  const normalized = dir.replace(/\\/g, "/");
+  return (
+    !!process.env["DATA_DIR"]?.trim() ||
+    normalized.includes("/smtools-data") ||
+    normalized.endsWith("smtools-data")
+  );
+}
 
 export function dataDir() {
-  const hosted = process.env["DATA_DIR"]?.trim() || hostingerKeep();
-  const dir = useDir(hosted || path.join(process.cwd(), "data"));
-  if (hosted) {
+  const root = dataRoot();
+  const dir = useDir(root);
+  if (isPersistentRoot(dir)) {
     recoverHostedAccounts(dir);
     copyMissing(path.join(process.cwd(), "data", "accounts.json"), path.join(dir, "accounts.json"));
     copyMissing(path.join(process.cwd(), "data", "desks"), path.join(dir, "desks"));
@@ -89,23 +160,23 @@ export function dataDir() {
 }
 
 export function imageDir() {
-  const hosted = process.env["DATA_DIR"]?.trim() || hostingerKeep();
-  const dir = useDir(hosted ? path.join(hosted, "images") : path.join(process.cwd(), "storage", "images"));
-  if (hosted) copyMissing(path.join(process.cwd(), "storage", "images"), dir);
+  const root = dataRoot();
+  const dir = useDir(isPersistentRoot(root) ? path.join(root, "images") : path.join(process.cwd(), "storage", "images"));
+  if (isPersistentRoot(root)) copyMissing(path.join(process.cwd(), "storage", "images"), dir);
   return dir;
 }
 
 export function videoDir() {
-  const hosted = process.env["DATA_DIR"]?.trim() || hostingerKeep();
-  const dir = useDir(hosted ? path.join(hosted, "videos") : path.join(process.cwd(), "storage", "videos"));
-  if (hosted) copyMissing(path.join(process.cwd(), "storage", "videos"), dir);
+  const root = dataRoot();
+  const dir = useDir(isPersistentRoot(root) ? path.join(root, "videos") : path.join(process.cwd(), "storage", "videos"));
+  if (isPersistentRoot(root)) copyMissing(path.join(process.cwd(), "storage", "videos"), dir);
   return dir;
 }
 
 export function audioDir() {
-  const hosted = process.env["DATA_DIR"]?.trim() || hostingerKeep();
-  const dir = useDir(hosted ? path.join(hosted, "audio") : path.join(process.cwd(), "storage", "audio"));
-  if (hosted) copyMissing(path.join(process.cwd(), "storage", "audio"), dir);
+  const root = dataRoot();
+  const dir = useDir(isPersistentRoot(root) ? path.join(root, "audio") : path.join(process.cwd(), "storage", "audio"));
+  if (isPersistentRoot(root)) copyMissing(path.join(process.cwd(), "storage", "audio"), dir);
   return dir;
 }
 
