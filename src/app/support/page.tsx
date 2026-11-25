@@ -31,7 +31,7 @@ export default async function SupportPage() {
     );
   }
   return (
-    <AppShell name={user.name} active="support">
+    <AppShell name={user.name} active="support" admin={user.admin}>
       <Body />
     </AppShell>
   );

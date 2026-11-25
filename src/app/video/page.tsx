@@ -9,13 +9,7 @@ export default async function VideoPage() {
   const user = await requireUser();
   const session = await readSession();
   return (
-    <AppShell name={user.name} active="video">
-      <header className="tool-head">
-        <div>
-          <h1>Video Duplicate</h1>
-          <p>Upload a video and create a new short clip from it.</p>
-        </div>
-      </header>
+    <AppShell name={user.name} active="video" admin={user.admin}>
       <VideoDesk csrf={session.csrf} />
     </AppShell>
   );

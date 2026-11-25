@@ -5,11 +5,17 @@ import {
   disconnect,
   generate,
   pickPage,
+  pickPages,
   publicState,
   publish,
+  regenerateCaption,
+  regenerateImage,
   runDue,
   runNext,
+  disconnectLinkedIn,
   saveConnection,
+  saveLinkedIn,
+  saveTargets,
   setTopicActive,
   updateCaption,
   updateTopic,
@@ -36,11 +42,28 @@ export async function POST(request: Request) {
       return deskJson(request);
     }
     if (action === "disconnect") {
-      await disconnect();
+      await disconnect(body.page_id ? String(body.page_id) : undefined);
+      return deskJson(request);
+    }
+    if (action === "save_linkedin") {
+      await saveLinkedIn(body);
+      return deskJson(request);
+    }
+    if (action === "disconnect_linkedin") {
+      await disconnectLinkedIn(body.org_id ? String(body.org_id) : undefined);
+      return deskJson(request);
+    }
+    if (action === "save_targets") {
+      await saveTargets(body);
       return deskJson(request);
     }
     if (action === "fb_pick") {
       await pickPage(String(body.page_id || ""));
+      return deskJson(request);
+    }
+    if (action === "fb_pick_many") {
+      const ids = Array.isArray(body.page_ids) ? body.page_ids.map((id) => String(id || "")) : [];
+      await pickPages(ids);
       return deskJson(request);
     }
     if (action === "topic_add") {
@@ -66,6 +89,14 @@ export async function POST(request: Request) {
     }
     if (action === "generate") {
       const topic = await generate(String(body.id || ""), !!body.post);
+      return deskJson(request, { topic });
+    }
+    if (action === "regenerate_caption") {
+      const topic = await regenerateCaption(String(body.id || ""), String(body.note || ""));
+      return deskJson(request, { topic });
+    }
+    if (action === "regenerate_image") {
+      const topic = await regenerateImage(String(body.id || ""), String(body.note || ""));
       return deskJson(request, { topic });
     }
     if (action === "publish") {

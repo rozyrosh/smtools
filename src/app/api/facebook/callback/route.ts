@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
 import { requireApi } from "@/server/accounts";
 import { finishFacebook } from "@/server/desk";
-import { facebookRedirect, publicError } from "@/server/paths";
+import { appOrigin, facebookRedirect, publicError } from "@/server/paths";
 import { csrfMatches, readSession, setFlash, writeSession } from "@/server/session";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
-  const back = new URL("/desk", request.url);
+  const back = new URL("/desk/connect", appOrigin(request));
   try {
     await requireApi();
     const url = new URL(request.url);

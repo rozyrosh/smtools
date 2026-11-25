@@ -1,7 +1,9 @@
 import { copyFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import path from "path";
+import { consumeCredit, requireCredit } from "./accounts";
 import { exchangeCode, listPages, pageInfo, publishPhoto } from "./facebook";
-import { makeImage, writePost } from "./gemini";
+import { makeImage, rewriteCaption, rewriteImagePrompt, writePost } from "./gemini";
+import { publishPhoto as publishLinkedInPhoto } from "./linkedin";
 import { appOrigin, DeskError, facebookRedirect, GRAPH_VERSION, imageDir, limitText, publicError, randomId } from "./paths";
 import { takeFlash } from "./session";
 import {
@@ -15,9 +17,18 @@ import {
   saveSettings,
   saveTopics,
   transaction,
+  upsertPage,
+  type ConnectedPage,
+  type PostedLink,
   type ScheduleRun,
   type Topic,
 } from "./store";
+
+export type PublicPostLink = {
+  id: string;
+  name: string;
+  url: string;
+};
 
 export type PublicTopic = {
   id: string;
@@ -26,6 +37,8 @@ export type PublicTopic = {
   language: string;
   tone: string;
   style: string;
+  quality: string;
+  ratio: string;
   status: string;
   caption: string;
   image_prompt: string;
@@ -33,6 +46,10 @@ export type PublicTopic = {
   error: string;
   fb_post_id: string;
   fb_url: string;
+  fb_posts: PublicPostLink[];
+  li_post_id: string;
+  li_url: string;
+  li_posts: PublicPostLink[];
   autopost: boolean;
   active: boolean;
   schedule: string;
@@ -52,10 +69,33 @@ export type PublicRun = {
   status: string;
   error: string;
   fb_url: string;
+  fb_posts: PublicPostLink[];
+  li_posts: PublicPostLink[];
   image_url: string;
   created_at: string;
   posted_at: string;
 };
+
+function asPostLinks(value: unknown, fallbackUrl = "", fallbackId = "", fallbackName = ""): PublicPostLink[] {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (!item || typeof item !== "object") return null;
+        const row = item as { id?: unknown; name?: unknown; url?: unknown };
+        const url = String(row.url || "").trim();
+        if (!url) return null;
+        return {
+          id: String(row.id || "").trim(),
+          name: String(row.name || "").trim() || fallbackName || "Page",
+          url,
+        };
+      })
+      .filter((item): item is PublicPostLink => !!item);
+  }
+  const url = String(fallbackUrl || "").trim();
+  if (!url) return [];
+  return [{ id: String(fallbackId || "").trim(), name: fallbackName || "Page", url }];
+}
 
 function imagePath(id: string) {
   return path.join(imageDir(), `${id}.img`);
@@ -164,7 +204,7 @@ function scheduleLabel(topic: Topic) {
 }
 
 function runStatus(topic: Topic) {
-  if (topic.fb_url || topic.posted_at) return "posted";
+  if (topic.fb_url || topic.li_url || topic.posted_at) return "posted";
   if (topic.status === "failed" || topic.error) return "failed";
   if (topic.status === "ready") return "ready";
   return "writing";
@@ -190,13 +230,17 @@ function copyImageIfNewer(fromId: string, toId: string, since: string) {
 function snapshotRun(topic: Topic): ScheduleRun {
   const id = randomId("pst");
   copyImage(topic.id, id);
+  const fbPosts = asPostLinks(topic.fb_posts, topic.fb_url, topic.fb_post_id, "Facebook");
+  const liPosts = asPostLinks(topic.li_posts, topic.li_url, topic.li_post_id, "LinkedIn");
   return {
     id,
     caption: topic.caption || "",
     status: runStatus(topic),
     error: topic.error || "",
     fb_post_id: topic.fb_post_id || "",
-    fb_url: topic.fb_url || "",
+    fb_url: topic.fb_url || fbPosts[0]?.url || "",
+    fb_posts: fbPosts,
+    li_posts: liPosts,
     created_at: topic.updated_at || topic.created_at || new Date().toISOString(),
     posted_at: topic.posted_at || "",
   };
@@ -214,6 +258,8 @@ function startRun(topic: Topic) {
     error: "",
     fb_post_id: "",
     fb_url: "",
+    fb_posts: [],
+    li_posts: [],
     created_at: new Date().toISOString(),
     posted_at: "",
   };
@@ -222,6 +268,10 @@ function startRun(topic: Topic) {
   topic.runs = topic.runs.slice(0, 40);
   topic.fb_url = "";
   topic.fb_post_id = "";
+  topic.fb_posts = [];
+  topic.li_url = "";
+  topic.li_post_id = "";
+  topic.li_posts = [];
   topic.posted_at = "";
 }
 
@@ -237,6 +287,8 @@ function syncRun(topic: Topic) {
       error: "",
       fb_post_id: "",
       fb_url: "",
+      fb_posts: [],
+      li_posts: [],
       created_at: topic.updated_at || new Date().toISOString(),
       posted_at: "",
     };
@@ -248,8 +300,10 @@ function syncRun(topic: Topic) {
   run.error = topic.error || "";
   run.fb_post_id = topic.fb_post_id || run.fb_post_id;
   run.fb_url = topic.fb_url || run.fb_url;
+  run.fb_posts = asPostLinks(topic.fb_posts, topic.fb_url, topic.fb_post_id, "Facebook");
+  run.li_posts = asPostLinks(topic.li_posts, topic.li_url, topic.li_post_id, "LinkedIn");
   run.posted_at = topic.posted_at || run.posted_at;
-  if (run.fb_url) run.status = "posted";
+  if (run.fb_url || run.fb_posts?.length || run.li_posts?.length) run.status = "posted";
   else if (topic.status === "failed") run.status = "failed";
   else if (topic.status === "ready") run.status = "ready";
   else if (topic.status === "writing") run.status = "writing";
@@ -261,33 +315,45 @@ function visibleRuns(topic: Topic): ScheduleRun[] {
   const runs = Array.isArray(topic.runs) ? topic.runs.filter((run) => run && typeof run.id === "string") : [];
   if (runs.length || !repeating(topic)) return runs;
   if (!topic.caption && !topic.error && !topic.fb_url && !topic.posted_at) return [];
+  const fbPosts = asPostLinks(topic.fb_posts, topic.fb_url, topic.fb_post_id, "Facebook");
+  const liPosts = asPostLinks(topic.li_posts, topic.li_url, topic.li_post_id, "LinkedIn");
   return [{
     id: topic.id,
     caption: topic.caption || "",
     status: runStatus(topic),
     error: topic.error || "",
     fb_post_id: topic.fb_post_id || "",
-    fb_url: topic.fb_url || "",
+    fb_url: topic.fb_url || fbPosts[0]?.url || "",
+    fb_posts: fbPosts,
+    li_posts: liPosts,
     created_at: topic.updated_at || topic.created_at || "",
     posted_at: topic.posted_at || "",
   }];
 }
 
 function publicRuns(topic: Topic): PublicRun[] {
-  return visibleRuns(topic).map((run) => ({
-    id: run.id,
-    caption: run.caption || "",
-    status: run.status || "writing",
-    error: publicError(run.error || ""),
-    fb_url: run.fb_url || "",
-    image_url: existsSync(imagePath(run.id)) ? `/api/image/${encodeURIComponent(run.id)}` : "",
-    created_at: run.created_at || "",
-    posted_at: run.posted_at || "",
-  }));
+  return visibleRuns(topic).map((run) => {
+    const fbPosts = asPostLinks(run.fb_posts, run.fb_url, run.fb_post_id, "Facebook");
+    const liPosts = asPostLinks(run.li_posts);
+    return {
+      id: run.id,
+      caption: run.caption || "",
+      status: run.status || "writing",
+      error: publicError(run.error || ""),
+      fb_url: run.fb_url || fbPosts[0]?.url || "",
+      fb_posts: fbPosts,
+      li_posts: liPosts,
+      image_url: existsSync(imagePath(run.id)) ? `/api/image/${encodeURIComponent(run.id)}` : "",
+      created_at: run.created_at || "",
+      posted_at: run.posted_at || "",
+    };
+  });
 }
 
 export function publicTopic(topic: Topic): PublicTopic {
   const hasImage = !!topic.id && existsSync(imagePath(topic.id));
+  const fbPosts = asPostLinks(topic.fb_posts, topic.fb_url, topic.fb_post_id, "Facebook");
+  const liPosts = asPostLinks(topic.li_posts, topic.li_url, topic.li_post_id, "LinkedIn");
   return {
     id: topic.id,
     title: topic.title || "",
@@ -295,13 +361,19 @@ export function publicTopic(topic: Topic): PublicTopic {
     language: topic.language || "",
     tone: topic.tone || "",
     style: topic.style || "",
+    quality: topic.quality || "1K",
+    ratio: topic.ratio || "1:1",
     status: topic.status || "queued",
     caption: topic.caption || "",
     image_prompt: topic.image_prompt || "",
     image_url: hasImage ? `/api/image/${encodeURIComponent(topic.id)}` : "",
     error: publicError(topic.error || ""),
     fb_post_id: topic.fb_post_id || "",
-    fb_url: topic.fb_url || "",
+    fb_url: topic.fb_url || fbPosts[0]?.url || "",
+    fb_posts: fbPosts,
+    li_post_id: topic.li_post_id || "",
+    li_url: topic.li_url || liPosts[0]?.url || "",
+    li_posts: liPosts,
     autopost: !!topic.autopost,
     active: topic.active !== false,
     schedule: topic.schedule || "once",
@@ -319,7 +391,13 @@ export function publicTopic(topic: Topic): PublicTopic {
 export async function publicState(request?: Request) {
   const settings = readSettings();
   const gemini = geminiKey();
-  const pending = readPending().map((page) => ({ id: page.id, name: page.name }));
+  const pageAvatar = (id: string, picture?: string) =>
+    String(picture || "").trim() || `https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(id)}/picture?type=large`;
+  const pending = readPending().map((page) => ({
+    id: page.id,
+    name: page.name,
+    picture: pageAvatar(page.id, page.picture),
+  }));
   const flash = await takeFlash();
   const topics = readTopics().map(publicTopic).sort((a, b) => b.created_at.localeCompare(a.created_at));
   const origin = appOrigin(request);
@@ -333,11 +411,36 @@ export async function publicState(request?: Request) {
       has_secret: settings.fb_app_secret !== "",
       page_id: settings.fb_page_id,
       page_name: settings.fb_page_name,
-      connected: settings.fb_page_id !== "" && settings.fb_page_token !== "" && settings.fb_page_name !== "",
+      connected: settings.fb_pages.length > 0,
+      pages: settings.fb_pages.map((page) => ({
+        id: page.id,
+        name: page.name,
+        active: page.active !== false,
+        picture: pageAvatar(page.id, page.picture),
+      })),
       redirect_uri: facebookRedirect(request),
     },
+    linkedin: {
+      client_id: settings.li_client_id,
+      org_id: settings.li_org_id,
+      org_name: settings.li_org_name,
+      connected: settings.li_orgs.length > 0,
+      orgs: settings.li_orgs.map((org) => ({ id: org.id, name: org.name, active: org.active !== false })),
+    },
+    targets: {
+      facebook: settings.post_facebook !== false,
+      linkedin: settings.post_linkedin !== false,
+      fb_page_ids: settings.fb_pages.filter((page) => page.active !== false).map((page) => page.id),
+      li_org_ids: settings.li_orgs.filter((org) => org.active !== false).map((org) => org.id),
+    },
     page_voice: settings.page_voice,
-    defaults: { language: settings.language, tone: settings.tone, style: settings.style },
+    defaults: {
+      language: settings.language,
+      tone: settings.tone,
+      style: settings.style,
+      quality: settings.quality || "1K",
+      ratio: settings.ratio || "1:1",
+    },
     pending_pages: pending,
     cron_url: `${origin}/api/cron?key=${encodeURIComponent(settings.cron_key)}`,
     flash,
@@ -351,21 +454,28 @@ export async function saveConnection(input: Record<string, unknown>) {
     const secret = String(input.app_secret || "").trim();
     const token = String(input.page_token || "").trim();
     if (secret) settings.fb_app_secret = secret;
-    if (token) settings.fb_page_token = token;
     settings.fb_app_id = String(input.app_id ?? settings.fb_app_id).trim();
-    const pageId = String(input.page_id ?? settings.fb_page_id).trim();
-    settings.fb_page_id = pageId.replace(/\D/g, "") || pageId;
     settings.page_voice = limitText(String(input.page_voice ?? settings.page_voice), 800);
     if (input.language) settings.language = limitText(String(input.language), 40);
     if (input.tone) settings.tone = limitText(String(input.tone), 40);
     if (input.style) settings.style = limitText(String(input.style), 40);
-    if (settings.fb_page_id && settings.fb_page_token) {
+    if (!settings.fb_app_id) throw new DeskError("Add the Meta app ID.");
+    if (!settings.fb_app_secret) throw new DeskError("Add the Meta app secret.");
+    // Only verify Graph when a page token was pasted. Stale page_id + old token
+    // must not block the normal OAuth redirect after saving the app.
+    if (token) {
+      const rawId = String(input.page_id ?? "").trim();
+      const pageId = rawId.replace(/\D/g, "") || rawId;
+      if (!pageId) throw new DeskError("Add the Page ID with the page token.");
       try {
-        const page = await pageInfo(settings.fb_page_id, settings.fb_page_token);
-        settings.fb_page_name = String(page.name || "Page");
-        settings.fb_page_id = String(page.id || settings.fb_page_id);
+        const page = await pageInfo(pageId, token);
+        settings.fb_pages = upsertPage(settings.fb_pages, {
+          id: String(page.id || pageId),
+          name: String(page.name || "Page"),
+          token,
+          picture: String(page.picture || ""),
+        }, true);
       } catch (error) {
-        settings.fb_page_name = "";
         saveSettings(settings);
         throw error;
       }
@@ -374,22 +484,97 @@ export async function saveConnection(input: Record<string, unknown>) {
   });
 }
 
-export function disconnect() {
+export function disconnect(pageId?: string) {
   return transaction(() => {
     const settings = readSettings();
-    settings.fb_page_id = "";
-    settings.fb_page_name = "";
-    settings.fb_page_token = "";
+    const id = String(pageId || "").trim();
+    if (id) {
+      settings.fb_pages = settings.fb_pages.filter((page) => page.id !== id);
+    } else {
+      settings.fb_pages = [];
+    }
     saveSettings(settings);
   });
 }
 
-export function rememberPage(page: { id: string; name: string; token: string }) {
+export async function saveLinkedIn(input: Record<string, unknown>) {
   return transaction(() => {
     const settings = readSettings();
-    settings.fb_page_id = page.id;
-    settings.fb_page_name = page.name;
-    settings.fb_page_token = page.token;
+    const secret = String(input.client_secret || "").trim();
+    const token = String(input.access_token || "").trim();
+    if (secret) settings.li_client_secret = secret;
+    settings.li_client_id = String(input.client_id ?? settings.li_client_id).trim();
+    const orgId = String(input.org_id ?? "").trim().replace(/^urn:li:organization:/, "");
+    const orgName = limitText(String(input.org_name ?? ""), 120) || "LinkedIn company";
+    if (!orgId) {
+      throw new DeskError("Add the LinkedIn company / organization ID.");
+    }
+    const existing = settings.li_orgs.find((org) => org.id === orgId);
+    const accessToken = token || existing?.token || "";
+    if (!accessToken) {
+      throw new DeskError("Add a LinkedIn access token to connect.");
+    }
+    settings.li_orgs = upsertPage(settings.li_orgs, {
+      id: orgId,
+      name: orgName || existing?.name || "LinkedIn company",
+      token: accessToken,
+    }, true);
+    saveSettings(settings);
+  });
+}
+
+export function disconnectLinkedIn(orgId?: string) {
+  return transaction(() => {
+    const settings = readSettings();
+    const id = String(orgId || "").trim().replace(/^urn:li:organization:/, "");
+    if (id) {
+      settings.li_orgs = settings.li_orgs.filter((org) => org.id !== id);
+    } else {
+      settings.li_orgs = [];
+    }
+    saveSettings(settings);
+  });
+}
+
+function setActiveIds(list: ConnectedPage[], ids: string[] | null, networkOn?: boolean) {
+  if (ids) {
+    const selected = new Set(ids.map((id) => id.trim()).filter(Boolean));
+    return list.map((page) => ({ ...page, active: selected.has(page.id) }));
+  }
+  if (typeof networkOn === "boolean") {
+    return list.map((page) => ({ ...page, active: networkOn }));
+  }
+  return list;
+}
+
+export function saveTargets(input: Record<string, unknown>) {
+  return transaction(() => {
+    const settings = readSettings();
+    const fbIds = Array.isArray(input.fb_page_ids) ? input.fb_page_ids.map((id) => String(id || "")) : null;
+    const liIds = Array.isArray(input.li_org_ids) ? input.li_org_ids.map((id) => String(id || "")) : null;
+    settings.fb_pages = setActiveIds(settings.fb_pages, fbIds, typeof input.facebook === "boolean" ? input.facebook : undefined);
+    settings.li_orgs = setActiveIds(settings.li_orgs, liIds, typeof input.linkedin === "boolean" ? input.linkedin : undefined);
+    saveSettings(settings);
+  });
+}
+
+export function rememberPage(page: { id: string; name: string; token: string; picture?: string }) {
+  return transaction(() => {
+    const settings = readSettings();
+    settings.fb_pages = upsertPage(settings.fb_pages, page, true);
+    saveSettings(settings);
+    clearPending();
+  });
+}
+
+export function rememberPages(pages: { id: string; name: string; token: string; picture?: string }[]) {
+  return transaction(() => {
+    const settings = readSettings();
+    let list = settings.fb_pages;
+    for (const page of pages) {
+      list = upsertPage(list, page, true);
+    }
+    settings.fb_pages = list;
     saveSettings(settings);
     clearPending();
   });
@@ -398,7 +583,7 @@ export function rememberPage(page: { id: string; name: string; token: string }) 
 function readScheduleInput(input: Record<string, unknown>) {
   const title = limitText(String(input.title || ""), 160);
   let about = String(input.about || "").trim();
-  if (about.length > 2000) about = about.slice(0, 2000);
+  if (about.length > 10000) about = about.slice(0, 10000);
   if (title.length < 2) throw new DeskError("Add a title.");
   if (about.length < 2) throw new DeskError("Add a short description of what the post is about.");
   let schedule = String(input.schedule || "once");
@@ -408,12 +593,18 @@ function readScheduleInput(input: Record<string, unknown>) {
   if (schedule !== "once" && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time)) {
     throw new DeskError("Set a time for this repeat.");
   }
+  let quality = String(input.quality || "1K");
+  if (!["1K", "2K", "4K"].includes(quality)) quality = "1K";
+  let ratio = String(input.ratio || "1:1");
+  if (!["1:1", "4:5", "9:16", "16:9", "4:3", "3:2"].includes(ratio)) ratio = "1:1";
   return {
     title,
     about,
     language: limitText(String(input.language || "Sinhala"), 40),
     tone: limitText(String(input.tone || "Friendly"), 40),
     style: limitText(String(input.style || "Photograph"), 40),
+    quality,
+    ratio,
     schedule,
     time: schedule === "once" ? "" : time,
     weekday: Math.max(1, Math.min(7, Number(input.weekday || 1))),
@@ -460,9 +651,12 @@ export async function addTopic(input: Record<string, unknown>, postNow: boolean)
     settings.language = topic.language;
     settings.tone = topic.tone;
     settings.style = topic.style;
+    settings.quality = topic.quality;
+    settings.ratio = topic.ratio;
     saveSettings(settings);
   });
   if (postNow && !repeat) return generate(topic.id, true);
+  if (!repeat) return generate(topic.id, false);
   return publicTopic(findTopic(topic.id) || topic);
 }
 
@@ -484,6 +678,8 @@ export function updateTopic(id: string, input: Record<string, unknown>) {
     topic.language = fields.language;
     topic.tone = fields.tone;
     topic.style = fields.style;
+    topic.quality = fields.quality;
+    topic.ratio = fields.ratio;
     topic.schedule = fields.schedule;
     topic.time = fields.time;
     topic.weekday = fields.weekday;
@@ -506,6 +702,8 @@ export function updateTopic(id: string, input: Record<string, unknown>) {
     settings.language = topic.language;
     settings.tone = topic.tone;
     settings.style = topic.style;
+    settings.quality = topic.quality;
+    settings.ratio = topic.ratio;
     saveSettings(settings);
     return publicTopic(topic);
   });
@@ -622,7 +820,83 @@ async function stopIfPaused(id: string) {
   });
 }
 
+export async function regenerateCaption(id: string, noteInput: string) {
+  requireCredit("post");
+  const note = limitText(String(noteInput || ""), 800);
+  const claimed = await transaction(() => claim(id));
+  const gemini = geminiKey();
+  if (!gemini.key) {
+    await fail(id, "Writing is not available right now.");
+    throw new DeskError("Writing is not available right now.");
+  }
+  try {
+    const settings = readSettings();
+    const caption = await rewriteCaption(gemini.key, claimed, settings.page_voice, note);
+    const saved = await transaction(() =>
+      patch(id, {
+        caption,
+        status: "ready",
+        error: "",
+        updated_at: new Date().toISOString(),
+      })
+    );
+    consumeCredit("post");
+    return saved;
+  } catch (error) {
+    const message = publicError(error instanceof Error ? error.message : "The caption could not be rewritten.");
+    await fail(id, message);
+    throw new DeskError(message, error instanceof DeskError ? error.status : 502);
+  }
+}
+
+export async function regenerateImage(id: string, noteInput: string) {
+  requireCredit("post");
+  const note = limitText(String(noteInput || ""), 800);
+  const claimed = await transaction(() => claim(id));
+  const gemini = geminiKey();
+  if (!gemini.key) {
+    await fail(id, "Writing is not available right now.");
+    throw new DeskError("Writing is not available right now.");
+  }
+  try {
+    const imagePrompt = note
+      ? await rewriteImagePrompt(gemini.key, claimed, note)
+      : claimed.image_prompt || (await rewriteImagePrompt(gemini.key, claimed, ""));
+    await transaction(() =>
+      patch(id, {
+        image_prompt: imagePrompt,
+        status: "writing",
+        updated_at: new Date().toISOString(),
+      })
+    );
+    const image = await makeImage(
+      gemini.key,
+      imagePrompt,
+      claimed.style,
+      claimed.ratio || "1:1",
+      claimed.quality || "1K",
+    );
+    writeFileSync(imagePath(id), image.bytes);
+    writeFileSync(`${imagePath(id)}.type`, image.mime);
+    const saved = await transaction(() =>
+      patch(id, {
+        image_prompt: imagePrompt,
+        status: "ready",
+        error: "",
+        updated_at: new Date().toISOString(),
+      })
+    );
+    consumeCredit("post");
+    return saved;
+  } catch (error) {
+    const message = publicError(error instanceof Error ? error.message : "The picture could not be rewritten.");
+    await fail(id, message);
+    throw new DeskError(message, error instanceof DeskError ? error.status : 502);
+  }
+}
+
 export async function generate(id: string, publishAfter: boolean, automatic = false) {
+  requireCredit("post");
   const claimed = await transaction(() => claim(id, automatic));
   const gemini = geminiKey();
   if (!gemini.key) {
@@ -643,7 +917,13 @@ export async function generate(id: string, publishAfter: boolean, automatic = fa
       })
     );
     if (automatic && (await stopIfPaused(id))) return publicTopic(findTopic(id) || claimed);
-    const image = await makeImage(gemini.key, written.image_prompt, claimed.style);
+    const image = await makeImage(
+      gemini.key,
+      written.image_prompt,
+      claimed.style,
+      claimed.ratio || "1:1",
+      claimed.quality || "1K",
+    );
     writeFileSync(imagePath(id), image.bytes);
     writeFileSync(`${imagePath(id)}.type`, image.mime);
     saved = await transaction(() =>
@@ -655,6 +935,7 @@ export async function generate(id: string, publishAfter: boolean, automatic = fa
         updated_at: new Date().toISOString(),
       })
     );
+    consumeCredit("post");
   } catch (error) {
     const message = publicError(error instanceof Error ? error.message : "The post could not be written.");
     await fail(id, message);
@@ -674,27 +955,56 @@ export async function publish(id: string) {
   const caption = (topic.caption || "").trim();
   if (!caption) throw new DeskError("Write the post before publishing it.");
   const settings = readSettings();
-  if (!settings.fb_page_id || !settings.fb_page_token) throw new DeskError("Connect a Facebook page before posting.");
+  const fbTargets = settings.fb_pages.filter((page) => page.active !== false && page.id && page.token);
+  const liTargets = settings.li_orgs.filter((org) => org.active !== false && org.id && org.token);
+  if (!fbTargets.length && !liTargets.length) {
+    if (!settings.fb_pages.length && !settings.li_orgs.length) {
+      throw new DeskError("Connect Facebook or LinkedIn before posting.");
+    }
+    throw new DeskError("Turn on at least one connected page for posting.");
+  }
   const file = imagePath(id);
   if (!existsSync(file)) throw new DeskError("The picture is not ready yet. Write the post again.");
   const mime = existsSync(`${file}.type`) ? readFileSync(`${file}.type`, "utf8").trim() : "image/png";
-  let posted: { id: string; url: string };
-  try {
-    posted = await publishPhoto(settings.fb_page_id, settings.fb_page_token, caption, file, mime);
-  } catch (error) {
-    const message = publicError(error instanceof Error ? error.message : "Facebook refused the post.");
+  const facebookPosts: PostedLink[] = [];
+  const linkedInPosts: PostedLink[] = [];
+  const errors: string[] = [];
+  for (const page of fbTargets) {
+    try {
+      const posted = await publishPhoto(page.id, page.token, caption, file, mime);
+      facebookPosts.push({ id: posted.id, name: page.name || "Facebook", url: posted.url });
+    } catch (error) {
+      errors.push(`${page.name}: ${publicError(error instanceof Error ? error.message : "Facebook refused the post.")}`);
+    }
+  }
+  for (const org of liTargets) {
+    try {
+      const posted = await publishLinkedInPhoto(org.id, org.token, caption, file, mime);
+      linkedInPosts.push({ id: posted.id, name: org.name || "LinkedIn", url: posted.url });
+    } catch (error) {
+      errors.push(`${org.name}: ${publicError(error instanceof Error ? error.message : "LinkedIn refused the post.")}`);
+    }
+  }
+  if (!facebookPosts.length && !linkedInPosts.length) {
+    const message = errors.join(" ") || "The post could not be published.";
     await fail(id, message);
-    throw new DeskError(message, error instanceof DeskError ? error.status : 502);
+    throw new DeskError(message, 502);
   }
   return transaction(() => {
     const current = findTopic(id);
     const again = !!current && repeating(current);
+    const facebookPost = facebookPosts[0];
+    const linkedInPost = linkedInPosts[0];
     return patch(id, {
       status: again ? "scheduled" : "posted",
-      error: "",
+      error: errors.length ? errors.join(" ") : "",
       attempts: 0,
-      fb_post_id: posted.id,
-      fb_url: posted.url,
+      fb_post_id: facebookPost?.id || current?.fb_post_id || "",
+      fb_url: facebookPost?.url || current?.fb_url || "",
+      fb_posts: facebookPosts.length ? facebookPosts : current?.fb_posts || [],
+      li_post_id: linkedInPost?.id || current?.li_post_id || "",
+      li_url: linkedInPost?.url || current?.li_url || "",
+      li_posts: linkedInPosts.length ? linkedInPosts : current?.li_posts || [],
       posted_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
       last_slot: again && current && isDue(current) ? slot(current) : current?.last_slot || "",
@@ -765,16 +1075,25 @@ export async function finishFacebook(code: string, redirectUri: string) {
   if (!pages.length) throw new DeskError("Facebook did not list a page for this login. Use an account that manages the page.");
   if (pages.length === 1) {
     await rememberPage(pages[0]);
-    return `Connected to ${pages[0].name}.`;
+    return `Connected ${pages[0].name}. You can connect more pages anytime.`;
   }
   await transaction(() => savePending(pages));
-  return "Choose the page this desk should publish to.";
+  return "Choose one or more pages to connect. You can keep several pages at once.";
 }
 
 export function pickPage(pageId: string) {
   const chosen = readPending().find((page) => page.id === pageId);
   if (!chosen) throw new DeskError("Choose a page from the list Facebook just returned.");
   return rememberPage(chosen);
+}
+
+export function pickPages(pageIds: string[]) {
+  const pending = readPending();
+  const chosen = pageIds
+    .map((id) => pending.find((page) => page.id === String(id || "").trim()))
+    .filter((page): page is { id: string; name: string; token: string; picture?: string } => !!page);
+  if (!chosen.length) throw new DeskError("Choose at least one page from the list Facebook just returned.");
+  return rememberPages(chosen);
 }
 
 export function topicImage(id: string) {

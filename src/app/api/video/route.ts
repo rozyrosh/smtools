@@ -16,7 +16,7 @@ export async function POST(request: Request) {
       throw new DeskError("The page expired. Reload and try again.", 403);
     }
     const form = await request.formData();
-    const saved = await createSimilarVideo(form.get("file"), String(form.get("changes") || ""));
+    const saved = await createSimilarVideo(form.get("file"), String(form.get("changes") || ""), String(form.get("resolution") || ""), String(form.get("ratio") || ""));
     return Response.json({ ok: true, ...saved }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     return failJson(error);

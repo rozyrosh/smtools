@@ -1,12 +1,13 @@
-import { createHash } from "crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { appendFileSync } from "fs";
 import path from "path";
-import { dataDir, DeskError, publicError, readEnvGeminiKey } from "./paths";
+import { dataDir, DeskError, publicError, readFreeGeminiKey, readPaidGeminiKey } from "./paths";
 import type { Topic } from "./store";
 
 const TEXT_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest"];
-const ANSWER_MODELS = ["gemini-flash-lite-latest", ...TEXT_MODELS];
 const IMAGE_MODELS = ["gemini-2.5-flash-image", "gemini-3.1-flash-image", "gemini-nano-banana-2.1"];
+const TTS_MODELS = ["gemini-2.5-flash-preview-tts", "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"];
+export const TTS_VOICES = ["Kore", "Puck", "Charon", "Aoede", "Fenrir", "Leda", "Orus", "Zephyr"] as const;
+export type TtsVoice = (typeof TTS_VOICES)[number];
 
 function logLine(message: string) {
   appendFileSync(path.join(dataDir(), "app.log"), `${new Date().toISOString()} ${publicError(message)}\n`);
@@ -89,12 +90,114 @@ function findImage(payload: unknown): { data: string; mime: string } | null {
   return found;
 }
 
+function findAudio(payload: unknown): { data: string; mime: string } | null {
+  let found: { data: string; mime: string } | null = null;
+  const walk = (node: unknown) => {
+    if (found || !node || typeof node !== "object") return;
+    const row = node as { mimeType?: string; mime_type?: string; data?: string };
+    const mime = String(row.mimeType || row.mime_type || "");
+    if (typeof row.data === "string" && row.data.length > 200 && (mime.startsWith("audio/") || mime.includes("pcm") || mime.includes("L16"))) {
+      found = { data: row.data, mime: mime || "audio/L16" };
+      return;
+    }
+    for (const child of Object.values(node)) walk(child);
+  };
+  walk(payload);
+  return found;
+}
+
+function pcmToWav(pcm: Buffer, sampleRate = 24000, channels = 1) {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * channels * 2, 28);
+  header.writeUInt16LE(channels * 2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+function audioBytes(raw: Buffer, mime: string) {
+  const kind = mime.toLowerCase();
+  if (kind.includes("wav")) return { bytes: raw, mime: "audio/wav" };
+  if (kind.includes("mpeg") || kind.includes("mp3")) return { bytes: raw, mime: "audio/mpeg" };
+  if (kind.includes("ogg")) return { bytes: raw, mime: "audio/ogg" };
+  // Gemini TTS typically returns raw PCM (s16le, 24 kHz, mono).
+  return { bytes: pcmToWav(raw), mime: "audio/wav" };
+}
+
+function shapeHint(ratio: string) {
+  const shapes: Record<string, string> = {
+    "1:1": "square (1:1)",
+    "4:5": "portrait (4:5)",
+    "9:16": "tall vertical story (9:16)",
+    "16:9": "wide landscape (16:9)",
+    "4:3": "landscape (4:3)",
+    "3:2": "landscape (3:2)",
+  };
+  return shapes[ratio] || "square (1:1)";
+}
+
+const IMAGE_PROMPT_MARKERS = [
+  /(?:^|\n)\s*here\s+is\s+the\s+image\s+prompt\s*:\s*/i,
+  /(?:^|\n)\s*here'?s\s+the\s+image\s+prompt\s*:\s*/i,
+  /(?:^|\n)\s*image\s+prompt\s*:\s*/i,
+  /(?:^|\n)\s*picture\s+prompt\s*:\s*/i,
+  /(?:^|\n)\s*visual\s+prompt\s*:\s*/i,
+];
+
+/** Split description into story text + optional user-supplied image prompt. */
+export function splitPostBrief(about: string): { story: string; imagePrompt: string } {
+  const raw = String(about || "").trim();
+  if (!raw) return { story: "", imagePrompt: "" };
+  for (const marker of IMAGE_PROMPT_MARKERS) {
+    const match = raw.match(marker);
+    if (!match || match.index == null) continue;
+    const story = raw.slice(0, match.index).trim();
+    const imagePrompt = raw.slice(match.index + match[0].length).trim();
+    if (imagePrompt.length >= 24) {
+      return { story: story || raw.slice(0, Math.min(280, raw.length)), imagePrompt };
+    }
+  }
+  return { story: raw, imagePrompt: "" };
+}
+
+function promptAllowsText(imagePrompt: string) {
+  return /\b(text|title|typography|lettering|letters?|words?|logo|brand title|font|sans-serif|typeface|headline|caption on (?:the )?(?:image|picture)|write (?:the )?(?:words?|title))\b/i.test(
+    imagePrompt,
+  );
+}
+
 export async function writePost(key: string, topic: Topic, pageVoice: string) {
   const voice = pageVoice.trim();
-  const prompt = `You write posts for a Facebook page.
+  const ratio = topic.ratio || "1:1";
+  const shape = shapeHint(ratio);
+  const brief = splitPostBrief(topic.about);
+  const story = brief.story || topic.about;
+  const givenImagePrompt = brief.imagePrompt;
+  const prompt = givenImagePrompt
+    ? `You write a Facebook caption for a page.
 
 Title: ${topic.title}
-What the post is about: ${topic.about}
+What the post is about: ${story}
+Language for the caption: ${topic.language}
+Tone: ${topic.tone}
+${voice ? `How this page should sound: ${voice}\n` : ""}
+Return only JSON with this shape:
+{"caption":"..."}
+
+caption: the Facebook post in ${topic.language}. Open with the point, then 2 to 4 short paragraphs a person would actually post. Close with 4 to 8 relevant hashtags. Do not mention that you are an AI. Do not use markdown. Do not invent an image prompt.`
+    : `You write posts for a Facebook page.
+
+Title: ${topic.title}
+What the post is about: ${story}
 Language for the caption: ${topic.language}
 Tone: ${topic.tone}
 ${voice ? `How this page should sound: ${voice}\n` : ""}
@@ -102,7 +205,7 @@ Return only JSON with this shape:
 {"caption":"...","image_prompt":"..."}
 
 caption: the Facebook post in ${topic.language}. Open with the point, then 2 to 4 short paragraphs a person would actually post. Close with 4 to 8 relevant hashtags. Do not mention that you are an AI. Do not use markdown.
-image_prompt: one English description of a square picture that supports the post. Picture style: ${topic.style}. Describe the subject, setting, light, and mood. The picture must contain no words, letters, numbers, logos, watermarks, or interface.`;
+image_prompt: one English description of a ${shape} picture that supports the post. Picture style: ${topic.style}. Follow the description closely: keep the same subjects, setting, mood, composition, and any on-image text the description asks for. If the description does not ask for words on the picture, keep the picture free of words, letters, numbers, logos, watermarks, or interface.`;
 
   let last = "The caption could not be written.";
   for (const model of TEXT_MODELS) {
@@ -115,7 +218,7 @@ image_prompt: one English description of a square picture that supports the post
       if (!text) throw new DeskError("The writing service returned an empty caption.");
       const parsed = decodeJson(text);
       const caption = String(parsed.caption || "").trim();
-      const imagePrompt = String(parsed.image_prompt || "").trim();
+      const imagePrompt = givenImagePrompt || String(parsed.image_prompt || "").trim();
       if (caption.length < 8 || imagePrompt.length < 8) throw new DeskError("The writing service returned a post that could not be used. Try again.");
       return { caption, image_prompt: imagePrompt };
     } catch (error) {
@@ -128,14 +231,111 @@ image_prompt: one English description of a square picture that supports the post
   throw new DeskError(last, 502);
 }
 
-export async function makeImage(key: string, imagePrompt: string, style: string) {
-  const prompt = `${imagePrompt}\n\nPicture style: ${style}.\nSquare composition. No text, letters, numbers, logos, watermarks, or borders.`;
-  let last = "The picture could not be created.";
-  for (const model of IMAGE_MODELS) {
+const IMAGE_RATIOS = new Set(["1:1", "4:5", "9:16", "16:9", "4:3", "3:2"]);
+const IMAGE_QUALITIES = new Set(["1K", "2K", "4K"]);
+
+export async function rewriteCaption(key: string, topic: Topic, pageVoice: string, note: string) {
+  const voice = pageVoice.trim();
+  const guidance = note.trim();
+  const story = splitPostBrief(topic.about).story || topic.about;
+  const prompt = `You rewrite a Facebook caption for a page.
+
+Title: ${topic.title}
+What the post is about: ${story}
+Language for the caption: ${topic.language}
+Tone: ${topic.tone}
+${voice ? `How this page should sound: ${voice}\n` : ""}
+Current caption:
+${topic.caption || "(none yet)"}
+${guidance ? `Change request from the user:\n${guidance}\n` : "Write a fresh caption in the same language and tone.\n"}
+Return only JSON: {"caption":"..."}
+caption: the Facebook post in ${topic.language}. Open with the point, then 2 to 4 short paragraphs a person would actually post. Close with 4 to 8 relevant hashtags. Do not mention that you are an AI. Do not use markdown.`;
+
+  let last = "The caption could not be rewritten.";
+  for (const model of TEXT_MODELS) {
     try {
       const payload = await post(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, key, {
         contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { responseModalities: ["IMAGE"] },
+        generationConfig: { temperature: 0.85, responseMimeType: "application/json" },
+      });
+      const text = collectText(payload);
+      if (!text) throw new DeskError("The writing service returned an empty caption.");
+      const caption = String(decodeJson(text).caption || "").trim();
+      if (caption.length < 8) throw new DeskError("The writing service returned a caption that could not be used. Try again.");
+      return caption;
+    } catch (error) {
+      const desk = error instanceof DeskError ? error : new DeskError(last, 502);
+      last = desk.message;
+      if (!tryNext(desk)) break;
+      logLine(`Caption rewrite model ${model} skipped: ${last}`);
+    }
+  }
+  throw new DeskError(last, 502);
+}
+
+export async function rewriteImagePrompt(key: string, topic: Topic, note: string) {
+  const ratio = topic.ratio || "1:1";
+  const shape = shapeHint(ratio);
+  const guidance = note.trim();
+  const brief = splitPostBrief(topic.about);
+  if (!guidance && brief.imagePrompt) return brief.imagePrompt;
+  const prompt = `You write one English image prompt for a Facebook post picture.
+
+Title: ${topic.title}
+What the post is about: ${brief.story || topic.about}
+${brief.imagePrompt ? `User-supplied image prompt (preserve this unless the change request overrides it):\n${brief.imagePrompt}\n` : ""}
+Caption:
+${topic.caption || brief.story || topic.about}
+Picture style: ${topic.style}
+Current image prompt:
+${topic.image_prompt || "(none yet)"}
+${guidance ? `Change request from the user:\n${guidance}\n` : "Create a fresh picture description that still fits the post.\n"}
+Return only JSON: {"image_prompt":"..."}
+image_prompt: one English description of a ${shape} picture. Keep the user's subjects, composition, style, and any requested on-image text. Only drop on-image text when the user did not ask for words on the picture.`;
+
+  let last = "The picture idea could not be rewritten.";
+  for (const model of TEXT_MODELS) {
+    try {
+      const payload = await post(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, key, {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.85, responseMimeType: "application/json" },
+      });
+      const text = collectText(payload);
+      if (!text) throw new DeskError("The writing service returned an empty picture idea.");
+      const imagePrompt = String(decodeJson(text).image_prompt || "").trim();
+      if (imagePrompt.length < 8) throw new DeskError("The writing service returned a picture idea that could not be used. Try again.");
+      return imagePrompt;
+    } catch (error) {
+      const desk = error instanceof DeskError ? error : new DeskError(last, 502);
+      last = desk.message;
+      if (!tryNext(desk)) break;
+      logLine(`Image rewrite model ${model} skipped: ${last}`);
+    }
+  }
+  throw new DeskError(last, 502);
+}
+
+export async function makeImage(
+  key: string,
+  imagePrompt: string,
+  style: string,
+  ratio = "1:1",
+  quality = "1K",
+) {
+  const aspectRatio = IMAGE_RATIOS.has(ratio) ? ratio : "1:1";
+  const imageSize = IMAGE_QUALITIES.has(quality) ? quality : "1K";
+  const allowText = promptAllowsText(imagePrompt);
+  const prompt = allowText
+    ? `${imagePrompt}\n\nPicture style: ${style}.\n${shapeHint(aspectRatio)} composition. Follow the prompt closely, including any requested titles or typography.`
+    : `${imagePrompt}\n\nPicture style: ${style}.\n${shapeHint(aspectRatio)} composition. No text, letters, numbers, logos, watermarks, or borders.`;
+  let last = "The picture could not be created.";
+  for (const model of IMAGE_MODELS) {
+    try {
+      const imageConfig: Record<string, string> = { aspectRatio };
+      if (model !== "gemini-2.5-flash-image") imageConfig.imageSize = imageSize;
+      const payload = await post(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, key, {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { responseModalities: ["IMAGE"], imageConfig },
       });
       const image = findImage(payload);
       if (!image) throw new DeskError("The writing service returned no picture.", 502);
@@ -168,174 +368,65 @@ function findVideo(payload: unknown): string | null {
   return found;
 }
 
-const VOICE_MODELS = ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"];
+export const VIDEO_RESOLUTIONS = ["360p", "720p", "1080p", "4k"] as const;
+export const VIDEO_RATIOS = ["16:9", "9:16"] as const;
+export type VideoResolution = (typeof VIDEO_RESOLUTIONS)[number];
+export type VideoRatio = (typeof VIDEO_RATIOS)[number];
 
-function findAudio(payload: unknown): { data: string; mime: string } | null {
-  let found: { data: string; mime: string } | null = null;
-  const walk = (node: unknown) => {
-    if (found || !node || typeof node !== "object") return;
-    const row = node as { type?: string; mimeType?: string; mime_type?: string; data?: string };
-    const mime = String(row.mimeType || row.mime_type || "");
-    if (typeof row.data === "string" && row.data.length > 1000 && (row.type === "audio" || mime.startsWith("audio/"))) {
-      found = { data: row.data, mime: mime || "audio/wav" };
-      return;
-    }
-    for (const child of Object.values(node)) walk(child);
-  };
-  walk(payload);
-  return found;
-}
+export async function makeSpeech(textInput: string, voiceInput = "Kore", styleInput = "") {
+  const text = String(textInput || "").replace(/\s+/gu, " ").trim();
+  if (text.length < 2) throw new DeskError("Add text to speak.");
+  if (text.length > 4000) throw new DeskError("Keep the text under 4,000 characters.");
+  const voice = (TTS_VOICES as readonly string[]).includes(voiceInput) ? voiceInput : "Kore";
+  const style = String(styleInput || "").replace(/\s+/gu, " ").trim().slice(0, 240);
+  const spoken = style
+    ? `Speak in this style: ${style}\n\nRead this aloud clearly, without adding extra words:\n${text}`
+    : `Read this aloud clearly, without adding extra words:\n${text}`;
+  const key = readPaidGeminiKey() || readFreeGeminiKey();
+  if (!key) throw new DeskError("Speech is not available right now.");
 
-export async function transcribeCall(key: string, audioBase64: string, mime: string) {
-  const cleanMime = mime.split(";")[0].trim() || "audio/webm";
-  const prompt = "Write down the words spoken in this audio, exactly as spoken. Do not add names, do not correct the speaker, and do not answer them. If there is no speech, return nothing.";
-  let last = "The call could not be heard.";
-  for (const model of ANSWER_MODELS) {
+  let last = "The audio could not be created.";
+  for (const model of TTS_MODELS) {
     try {
       const payload = await post(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
         key,
         {
-          contents: [{
-            role: "user",
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType: cleanMime, data: audioBase64 } },
-            ],
-          }],
-          generationConfig: { temperature: 0 },
+          contents: [{ role: "user", parts: [{ text: spoken }] }],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: voice },
+              },
+            },
+          },
         },
-        "answering service",
-        25000
+        "speech service",
+        120000,
       );
-      const text = collectText(payload).replace(/^["'\s]+|["'\s]+$/g, "").replace(/^transcript:?\s*/i, "").trim();
-      if (!text || /^(silence|no speech|nobody spoke|n\/a|empty|none|\(silence\)|\(no speech\))$/i.test(text)) return "";
-      return text.slice(0, 500);
+      const audio = findAudio(payload);
+      if (!audio) throw new DeskError("The speech service returned no audio.", 502);
+      const raw = Buffer.from(audio.data, "base64");
+      if (raw.length < 500) throw new DeskError("The speech service returned empty audio.", 502);
+      return audioBytes(raw, audio.mime);
     } catch (error) {
       const desk = error instanceof DeskError ? error : new DeskError(last, 502);
       last = desk.message;
-      logLine(`Hearing model ${model} skipped: ${last}`);
       if (!tryNext(desk)) break;
+      logLine(`TTS model ${model} skipped: ${last}`);
     }
   }
   throw new DeskError(last, 502);
 }
 
-const voiceJobs = new Map<string, Promise<{ data: string; mime: string }>>();
-const voiceHold = new Map<string, number>();
-
-function holdVoice(slot: string, model: string, message: string) {
-  const wait = message.match(/retry in (\d+)h(\d+)m(\d+)s/i);
-  const ms = wait ? (Number(wait[1]) * 3600 + Number(wait[2]) * 60 + Number(wait[3])) * 1000 : 30 * 60 * 1000;
-  voiceHold.set(`${slot}:${model}`, Date.now() + ms);
-}
-
-function voiceFile(line: string) {
-  const id = createHash("sha256").update(line).digest("hex").slice(0, 24);
-  const dir = path.join(dataDir(), "voice-cache");
-  return { id, file: path.join(dir, `${id}.wav`), dir };
-}
-
-export function sameUtterance(left: string, right: string) {
-  const norm = (value: string) => value.toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
-  const a = norm(left);
-  const b = norm(right);
-  if (a.length < 8 || b.length < 8) return false;
-  if (a === b || a.includes(b) || b.includes(a)) return true;
-  const words = new Set(a.split(" "));
-  const other = b.split(" ").filter((word) => word.length > 2);
-  if (!other.length) return false;
-  const shared = other.filter((word) => words.has(word)).length;
-  return shared / other.length > 0.75;
-}
-
-export function pickupLine(company: string) {
-  return `Thank you for calling ${company}. This is ${deskName(company)} speaking.`;
-}
-
-async function requestVoice(key: string, model: string, line: string) {
-  const payload = await post(
-    "https://generativelanguage.googleapis.com/v1beta/interactions",
-    key,
-    {
-      model,
-      input: [
-        {
-          type: "user_input",
-          content: [{ type: "text", text: line }],
-        },
-      ],
-      response_format: { type: "audio" },
-      generation_config: { speech_config: [{ voice: "en-us-cleo" }] },
-    },
-    "voice",
-    18000
-  );
-  const audio = findAudio(payload);
-  if (!audio) throw new DeskError("The voice returned no sound.", 502);
-  return audio;
-}
-
-async function renderVoice(key: string, line: string) {
-  let last = "The voice could not be spoken.";
-  const paid = readEnvGeminiKey();
-  const keys = paid && paid !== key ? [key, paid] : [key];
-  for (let slot = 0; slot < keys.length; slot += 1) {
-    for (const model of VOICE_MODELS) {
-      const hold = voiceHold.get(`${slot}:${model}`) || 0;
-      if (hold > Date.now()) continue;
-      try {
-        return await requestVoice(keys[slot], model, line);
-      } catch (error) {
-        const desk = error instanceof DeskError ? error : new DeskError(last, 502);
-        last = desk.message;
-        if (desk.status === 429 || /rate|resource_exhausted/i.test(desk.message)) holdVoice(String(slot), model, desk.message);
-        logLine(`Voice model ${model} skipped: ${last}`);
-      }
-    }
-  }
-  throw new DeskError(last, 502);
-}
-
-const SINHALA_NAMES: [RegExp, string][] = [
-  [/\bThimbirigasyaya\b/gi, "Thim-bi-ri-gas-yaa-ya"],
-  [/\bKavindi\b/gi, "කාවින්දි"],
-  [/\bSanduni\b/gi, "සඳුනි"],
-  [/\bThisara\b/gi, "තිසර"],
-  [/\bNishal\b/gi, "නිශාල්"],
-  [/\bAmaya\b/gi, "අමායා"],
-];
-
-export function sinhalaSpeech(text: string) {
-  let line = text;
-  for (const [pattern, spoken] of SINHALA_NAMES) line = line.replace(pattern, spoken);
-  return line;
-}
-
-export async function speakNaturally(key: string, text: string) {
-  const line = sinhalaSpeech(text.replace(/\s+/g, " ").trim()).slice(0, 600);
-  if (line.length < 2) throw new DeskError("There is nothing to say.");
-  const saved = voiceFile(line);
-  if (existsSync(saved.file)) return { data: readFileSync(saved.file).toString("base64"), mime: "audio/wav" };
-  const running = voiceJobs.get(saved.id);
-  if (running) return running;
-  const job = renderVoice(key, line).then((audio) => {
-    if (!existsSync(saved.dir)) mkdirSync(saved.dir, { recursive: true });
-    writeFileSync(saved.file, Buffer.from(audio.data, "base64"));
-    return audio;
-  }).finally(() => {
-    voiceJobs.delete(saved.id);
-  });
-  voiceJobs.set(saved.id, job);
-  return job;
-}
-
-export async function makeSimilarVideo(video: Buffer, changes: string, aspect: "16:9" | "9:16", duration: string) {
-  const key = readEnvGeminiKey();
+export async function makeSimilarVideo(video: Buffer, changes: string, aspect: VideoRatio, duration: string, resolution: VideoResolution) {
+  const key = readFreeGeminiKey();
   if (!key) throw new DeskError("The video service is not configured.", 503);
   const prompt = `Create a new video based on the uploaded clip.
 Keep the same subject, place, and action unless the change asks otherwise.
 Change to apply: ${changes}
+Output shape: ${aspect}. Output resolution: ${resolution}.
 No captions, logos, or watermarks.`;
   const payload = await post(
     "https://generativelanguage.googleapis.com/v1beta/interactions",
@@ -346,7 +437,7 @@ No captions, logos, or watermarks.`;
         { type: "video", data: video.toString("base64"), mime_type: "video/mp4" },
         { type: "text", text: prompt },
       ],
-      response_format: { type: "video", duration, resolution: "720p", aspect_ratio: aspect },
+      response_format: { type: "video", duration, resolution, aspect_ratio: aspect },
     },
     "video service",
     240000
@@ -360,142 +451,3 @@ No captions, logos, or watermarks.`;
   return bytes;
 }
 
-const DESK_NAMES = ["Amaya", "Nishal", "Kavindi", "Thisara", "Sanduni"];
-
-export function deskName(company: string) {
-  let total = 0;
-  for (const char of company.toLowerCase()) total += char.charCodeAt(0);
-  return DESK_NAMES[total % DESK_NAMES.length];
-}
-
-function cannedHelp(line: string) {
-  return /how can i help|how may i help|what can i help|how can i assist|what can i do for you|how may i assist/i.test(line);
-}
-
-export async function callOpening(key: string, company: string) {
-  const name = deskName(company);
-  const fallback = `Thank you for calling ${company}. This is ${name} speaking.`;
-  const prompt = `Write the first line a person says when they pick up a live phone call for ${company}.
-The speaker's name is ${name}.
-Sound like a real call-centre person: warm, brief, and unhurried. Thank them for calling, name the company, and introduce yourself.
-Do not ask how you can help, and do not ask what they need.
-One or two short spoken sentences only. No labels or stage directions.
-Return only JSON: {"line":"..."}`;
-  for (const model of ANSWER_MODELS) {
-    try {
-      const payload = await post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-        key,
-        {
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.7, responseMimeType: "application/json" },
-        },
-        "answering service",
-        20000
-      );
-      const text = collectText(payload);
-      const line = String(decodeJson(text).line || "").replace(/\s+/g, " ").trim();
-      if (line.length >= 8 && line.length <= 220 && !cannedHelp(line)) return line;
-    } catch (error) {
-      const desk = error instanceof DeskError ? error : new DeskError("The opening line could not be written.", 502);
-      logLine(`Opening model ${model} skipped: ${desk.message}`);
-      if (!tryNext(desk)) break;
-    }
-  }
-  return fallback;
-}
-
-export async function answerHeardCall(key: string, company: string, instructions: string, audioBase64: string, mime: string) {
-  const cleanMime = mime.split(";")[0].trim() || "audio/webm";
-  const refusal = `Please ask questions about ${company}.`;
-  const prompt = `You are answering a live phone call for ${company}. The audio is the caller speaking.
-heard is only what the caller said.
-answer is one short spoken sentence with the fact from the instructions.
-Do not repeat the caller's question. Do not ask any question.
-If the instructions do not contain the answer, answer must be exactly: ${refusal}
-Return only JSON: {"heard":"...","answer":"..."}
-
-Instructions:
-${instructions}`;
-  let last = "The call could not be heard.";
-  for (const model of ANSWER_MODELS) {
-    try {
-      const payload = await post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-        key,
-        {
-          contents: [{
-            role: "user",
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType: cleanMime, data: audioBase64 } },
-            ],
-          }],
-          generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
-        },
-        "answering service",
-        15000
-      );
-      const parsed = decodeJson(collectText(payload));
-      const heard = String(parsed.heard || "").replace(/\s+/g, " ").trim().slice(0, 500);
-      const answer = String(parsed.answer || "").replace(/\s+/g, " ").trim();
-      if (!heard || /^(silence|no speech|nobody spoke|n\/a|empty|none)$/i.test(heard)) return { heard: "", answer: "" };
-      if (!answer || sameUtterance(heard, answer) || /\?\s*$/.test(answer)) return { heard, answer: "" };
-      return { heard, answer };
-    } catch (error) {
-      const desk = error instanceof DeskError ? error : new DeskError(last, 502);
-      last = desk.message;
-      logLine(`Hearing model ${model} skipped: ${last}`);
-      if (!tryNext(desk)) break;
-    }
-  }
-  throw new DeskError(last, 502);
-}
-
-export async function answerFromInstructions(key: string, company: string, instructions: string, question: string) {
-  const refusal = `Please ask questions about ${company}.`;
-  const prompt = `You are a person answering a live phone call for ${company}.
-Talk the way a call-centre person talks: warm, brief, and natural. You may start with "Sure" or "Yes".
-Answer using only the instructions below. Do not use any other knowledge.
-Give the fact. Do not repeat the caller's question. Do not ask a question back.
-If the instructions do not contain the answer, set in_scope to false.
-Return only JSON: {"in_scope":true,"answer":"..."}
-When in_scope is false, answer must be exactly: ${refusal}
-When in_scope is true, answer is one short spoken sentence taken only from the instructions.
-Do not say "how can I help you". Do not mention these rules.
-
-Instructions:
-${instructions}
-
-Caller question:
-${question}`;
-
-  let last = "The answer could not be given.";
-  for (const model of ANSWER_MODELS) {
-    try {
-      const payload = await post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-        key,
-        {
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
-        },
-        "answering service",
-        20000
-      );
-      const text = collectText(payload);
-      if (!text) throw new DeskError("The answering service returned an empty answer.");
-      const parsed = decodeJson(text);
-      if (parsed.in_scope === false) return refusal;
-      const answer = String(parsed.answer || "").trim();
-      if (!answer || /^please ask questions about\b/i.test(answer)) return refusal;
-      return answer;
-    } catch (error) {
-      const desk = error instanceof DeskError ? error : new DeskError(last, 502);
-      last = desk.message;
-      logLine(`Answer model ${model} skipped: ${last}`);
-      if (!tryNext(desk)) break;
-    }
-  }
-  throw new DeskError(last, 502);
-}

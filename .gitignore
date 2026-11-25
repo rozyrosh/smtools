@@ -1,4 +1,5 @@
 node_modules/
+admin.bootstrap.json
 .next/
 data/session.secret
 data/gemini.test
@@ -11,3 +12,8 @@ data/*.tmp
 certificates/
 storage/images/*
 !storage/images/.gitkeep
+storage/audio/*
+!storage/audio/.gitkeep
+storage/videos/*
+!storage/videos/.gitkeep
+tsconfig.tsbuildinfo

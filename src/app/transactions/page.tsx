@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 export default async function TransactionsPage() {
   const user = await requireUser();
   return (
-    <AppShell name={user.name} active="transactions">
+    <AppShell name={user.name} active="transactions" admin={user.admin}>
       <header className="tool-head">
         <div>
           <h1>Transactions</h1>

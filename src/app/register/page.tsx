@@ -1,4 +1,5 @@
 import { Nav } from "@/components/Nav";
+import { SiteFooter } from "@/components/SiteFooter";
 import { registerAction } from "@/server/auth";
 
 export const dynamic = "force-dynamic";
@@ -24,6 +25,7 @@ export default async function RegisterPage({
           <a className="text-btn" href="/login">Login</a>
         </form>
       </main>
+      <SiteFooter />
     </>
   );
 }

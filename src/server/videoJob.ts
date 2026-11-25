@@ -2,8 +2,10 @@ import { spawn } from "child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
-import { makeSimilarVideo } from "./gemini";
+import { consumeCredit, requireCredit } from "./accounts";
+import { makeSimilarVideo, VIDEO_RATIOS, VIDEO_RESOLUTIONS, type VideoRatio, type VideoResolution } from "./gemini";
 import { DeskError, limitText, randomId, videoDir } from "./paths";
+import { currentScope } from "./store";
 
 const MAX_BYTES = 80 * 1024 * 1024;
 
@@ -64,7 +66,21 @@ async function clipShape(file: string): Promise<"16:9" | "9:16"> {
   return "16:9";
 }
 
-export async function createSimilarVideo(upload: unknown, changes: string) {
+function chosenResolution(value: string): VideoResolution {
+  const picked = value.trim() as VideoResolution;
+  if ((VIDEO_RESOLUTIONS as readonly string[]).includes(picked)) return picked;
+  throw new DeskError("Choose a resolution: 360p, 720p, 1080p, or 4K.");
+}
+
+function chosenRatio(value: string): VideoRatio {
+  const picked = value.trim() as VideoRatio;
+  if ((VIDEO_RATIOS as readonly string[]).includes(picked)) return picked;
+  throw new DeskError("Choose a ratio: 16:9 or 9:16.");
+}
+
+export async function createSimilarVideo(upload: unknown, changes: string, resolutionRaw: string, ratioRaw: string) {
+  const userId = currentScope();
+  requireCredit("video", userId);
   if (!(upload instanceof File) || upload.size < 1) throw new DeskError("Choose a video first.");
   if (upload.size > MAX_BYTES) throw new DeskError("That video is too large. Use a file under 80MB.");
   const name = upload.name.toLowerCase();
@@ -72,6 +88,8 @@ export async function createSimilarVideo(upload: unknown, changes: string) {
   if (!allowed) throw new DeskError("Use an MP4 or MOV video.");
   const asked = limitText(changes, 2000);
   if (asked.length < 2) throw new DeskError("Say what should change in the new video.");
+  const resolution = chosenResolution(resolutionRaw);
+  const ratio = chosenRatio(ratioRaw);
 
   const scratch = mkdtempSync(path.join(tmpdir(), "smvideo-"));
   const source = path.join(scratch, "source.bin");
@@ -95,9 +113,10 @@ export async function createSimilarVideo(upload: unknown, changes: string) {
     if (prepared.length < 1000) throw new DeskError("That video could not be prepared. Use an MP4 or MOV.");
     const duration = await clipDuration(clip);
     if (duration !== "6s") throw new DeskError("That video could not be prepared. Use an MP4 or MOV.");
-    const made = await makeSimilarVideo(prepared, asked, aspect, duration);
+    const made = await makeSimilarVideo(prepared, asked, ratio, duration, resolution);
     const id = randomId("vid");
     writeFileSync(path.join(videoDir(), `${id}.mp4`), made);
+    consumeCredit("video", userId);
     return { id, url: `/api/video/${id}` };
   } finally {
     rmSync(scratch, { recursive: true, force: true });

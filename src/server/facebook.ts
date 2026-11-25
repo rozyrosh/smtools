@@ -48,22 +48,46 @@ export async function exchangeCode(appId: string, secret: string, code: string, 
   return String(long.access_token || token);
 }
 
+function pictureUrl(pageId: string, picture?: unknown) {
+  if (picture && typeof picture === "object") {
+    const data = (picture as { data?: { url?: string }; url?: string }).data || picture;
+    const url = String((data as { url?: string }).url || "").trim();
+    if (url) return url;
+  }
+  return `https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(pageId)}/picture?type=large`;
+}
+
 export async function listPages(userToken: string) {
   const payload = await request("GET", graph("me/accounts", {
-    fields: "id,name,access_token",
+    fields: "id,name,access_token,picture.type(large){url}",
     limit: "50",
     access_token: userToken,
   }));
   const rows = Array.isArray(payload.data) ? payload.data : [];
   return rows.flatMap((page) => {
-    const row = page as { id?: string; name?: string; access_token?: string };
+    const row = page as { id?: string; name?: string; access_token?: string; picture?: unknown };
     if (!row.id || !row.access_token) return [];
-    return [{ id: String(row.id), name: String(row.name || "Page"), token: String(row.access_token) }];
+    const id = String(row.id);
+    return [{
+      id,
+      name: String(row.name || "Page"),
+      token: String(row.access_token),
+      picture: pictureUrl(id, row.picture),
+    }];
   });
 }
 
 export async function pageInfo(pageId: string, token: string) {
-  return request("GET", graph(pageId, { fields: "id,name,link", access_token: token }));
+  const payload = await request("GET", graph(pageId, {
+    fields: "id,name,link,picture.type(large){url}",
+    access_token: token,
+  }));
+  const id = String(payload.id || pageId);
+  return {
+    ...payload,
+    id,
+    picture: pictureUrl(id, (payload as { picture?: unknown }).picture),
+  };
 }
 
 export async function publishPhoto(pageId: string, token: string, caption: string, imagePath: string | null, mime: string | null) {

@@ -1,4 +1,5 @@
 import { Nav } from "@/components/Nav";
+import { SiteFooter } from "@/components/SiteFooter";
 import { loginAction } from "@/server/auth";
 
 export const dynamic = "force-dynamic";
@@ -19,6 +20,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
           <a className="text-btn" href="/register">Get Started</a>
         </form>
       </main>
+      <SiteFooter />
     </>
   );
 }

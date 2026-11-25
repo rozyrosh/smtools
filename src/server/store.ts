@@ -1,8 +1,16 @@
 import { AsyncLocalStorage } from "async_hooks";
 import { randomBytes } from "crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import path from "path";
-import { dataDir, DeskError, randomId, readStudioGeminiKey } from "./paths";
+import { dataDir, DeskError, readPaidGeminiKey } from "./paths";
+
+export type ConnectedPage = {
+  id: string;
+  name: string;
+  token: string;
+  active: boolean;
+  picture?: string;
+};
 
 export type Settings = {
   gemini_api_key: string;
@@ -11,12 +19,29 @@ export type Settings = {
   fb_page_id: string;
   fb_page_name: string;
   fb_page_token: string;
+  fb_pages: ConnectedPage[];
+  li_client_id: string;
+  li_client_secret: string;
+  li_org_id: string;
+  li_org_name: string;
+  li_access_token: string;
+  li_orgs: ConnectedPage[];
+  post_facebook: boolean;
+  post_linkedin: boolean;
   page_voice: string;
   language: string;
   tone: string;
   style: string;
+  quality: string;
+  ratio: string;
   cron_key: string;
   allow_studio_key: boolean;
+};
+
+export type PostedLink = {
+  id: string;
+  name: string;
+  url: string;
 };
 
 export type ScheduleRun = {
@@ -26,6 +51,8 @@ export type ScheduleRun = {
   error: string;
   fb_post_id: string;
   fb_url: string;
+  fb_posts?: PostedLink[];
+  li_posts?: PostedLink[];
   created_at: string;
   posted_at: string;
 };
@@ -37,6 +64,8 @@ export type Topic = {
   language: string;
   tone: string;
   style: string;
+  quality: string;
+  ratio: string;
   schedule: string;
   time: string;
   weekday: number;
@@ -54,6 +83,10 @@ export type Topic = {
   error: string;
   fb_post_id: string;
   fb_url: string;
+  fb_posts?: PostedLink[];
+  li_post_id?: string;
+  li_url?: string;
+  li_posts?: PostedLink[];
   attempts: number;
   created_at: string;
   updated_at: string;
@@ -67,13 +100,102 @@ const defaults = (): Settings => ({
   fb_page_id: "",
   fb_page_name: "",
   fb_page_token: "",
+  fb_pages: [],
+  li_client_id: "",
+  li_client_secret: "",
+  li_org_id: "",
+  li_org_name: "",
+  li_access_token: "",
+  li_orgs: [],
+  post_facebook: true,
+  post_linkedin: true,
   page_voice: "",
   language: "Sinhala",
   tone: "Friendly",
   style: "Photograph",
+  quality: "1K",
+  ratio: "1:1",
   cron_key: "",
   allow_studio_key: false,
 });
+
+function asPages(value: unknown): ConnectedPage[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const row = item as { id?: unknown; name?: unknown; token?: unknown; active?: unknown; picture?: unknown };
+      const id = String(row.id || "").trim();
+      const token = String(row.token || "").trim();
+      if (!id || !token) return null;
+      const picture = String(row.picture || "").trim();
+      return {
+        id,
+        name: String(row.name || "Page").trim() || "Page",
+        token,
+        active: row.active !== false,
+        ...(picture ? { picture } : {}),
+      };
+    })
+    .filter((item): item is ConnectedPage => !!item);
+}
+
+/** Migrate legacy single-slot FB/LI fields into arrays and keep scalars in sync. */
+export function normalizeSettings(settings: Settings): Settings {
+  const next = { ...settings };
+  next.fb_pages = asPages(next.fb_pages);
+  next.li_orgs = asPages(next.li_orgs);
+
+  if (!next.fb_pages.length && next.fb_page_id && next.fb_page_token) {
+    next.fb_pages = [{
+      id: next.fb_page_id,
+      name: next.fb_page_name || "Page",
+      token: next.fb_page_token,
+      active: next.post_facebook !== false,
+    }];
+  }
+  if (!next.li_orgs.length && next.li_org_id && next.li_access_token) {
+    next.li_orgs = [{
+      id: next.li_org_id.replace(/^urn:li:organization:/, ""),
+      name: next.li_org_name || "LinkedIn company",
+      token: next.li_access_token,
+      active: next.post_linkedin !== false,
+    }];
+  }
+
+  const primaryFb = next.fb_pages.find((page) => page.active) || next.fb_pages[0] || null;
+  next.fb_page_id = primaryFb?.id || "";
+  next.fb_page_name = primaryFb?.name || "";
+  next.fb_page_token = primaryFb?.token || "";
+  next.post_facebook = next.fb_pages.some((page) => page.active);
+
+  const primaryLi = next.li_orgs.find((page) => page.active) || next.li_orgs[0] || null;
+  next.li_org_id = primaryLi?.id || "";
+  next.li_org_name = primaryLi?.name || "";
+  next.li_access_token = primaryLi?.token || "";
+  next.post_linkedin = next.li_orgs.some((page) => page.active);
+
+  return next;
+}
+
+export function upsertPage(
+  list: ConnectedPage[],
+  page: { id: string; name: string; token: string; picture?: string },
+  active = true
+) {
+  const id = page.id.trim();
+  const prev = list.find((item) => item.id === id);
+  const next = list.filter((item) => item.id !== id);
+  const picture = String(page.picture || prev?.picture || "").trim();
+  next.push({
+    id,
+    name: page.name.trim() || "Page",
+    token: page.token.trim(),
+    active,
+    ...(picture ? { picture } : {}),
+  });
+  return next;
+}
 
 const localUser = new AsyncLocalStorage<string>();
 let scope: string | null = null;
@@ -134,21 +256,21 @@ function writeJson(file: string, data: unknown) {
 
 export function readSettings(): Settings {
   const saved = readJson<Partial<Settings>>(deskPath("settings"), {});
-  const settings = { ...defaults(), ...saved };
+  let settings = normalizeSettings({ ...defaults(), ...saved });
   if (!settings.cron_key) {
-    settings.cron_key = randomBytes(16).toString("hex");
+    settings = { ...settings, cron_key: randomBytes(16).toString("hex") };
     writeJson(deskPath("settings"), settings);
   }
   return settings;
 }
 
 export function saveSettings(settings: Settings) {
-  writeJson(deskPath("settings"), settings);
+  writeJson(deskPath("settings"), normalizeSettings(settings));
 }
 
 export function geminiKey() {
-  const studio = readStudioGeminiKey();
-  if (studio) return { key: studio, source: "house" };
+  const paid = readPaidGeminiKey();
+  if (paid) return { key: paid, source: "paid" };
   return { key: "", source: "" };
 }
 
@@ -161,117 +283,6 @@ export function saveTopics(topics: Topic[]) {
   writeJson(deskPath("topics"), topics);
 }
 
-export type CallAgent = {
-  id: string;
-  name: string;
-  company: string;
-  instructions: string;
-  active: boolean;
-  created_at: string;
-  widget_name: string;
-  widget_label: boolean;
-  widget_chat: boolean;
-  widget_color: string;
-  widget_greeting: string;
-  widget_pages: string;
-  widget_on: boolean;
-};
-
-export function normalizeStoredAgent(item: Partial<CallAgent>): { agent: CallAgent | null; dirty: boolean } {
-  const name = typeof item.name === "string" ? item.name.trim() : "";
-  const company = typeof item.company === "string" ? item.company.trim() : "";
-  const instructions = typeof item.instructions === "string" ? item.instructions.trim() : "";
-  if (name.length < 2 || company.length < 2 || instructions.length < 8) return { agent: null, dirty: false };
-  let dirty = false;
-  let id = typeof item.id === "string" ? item.id : "";
-  if (!/^call_[a-f0-9]{12}$/.test(id)) {
-    id = "";
-    dirty = true;
-  }
-  const created_at = typeof item.created_at === "string" && item.created_at ? item.created_at : new Date().toISOString();
-  const active = item.active !== false;
-  const widget_name = typeof item.widget_name === "string" && item.widget_name.trim() ? item.widget_name.trim().slice(0, 40) : name;
-  const widget_label = item.widget_label === true;
-  const widget_chat = item.widget_chat === true;
-  const rawColor = typeof item.widget_color === "string" ? item.widget_color.trim() : "";
-  const widget_color = /^#[0-9a-fA-F]{6}$/.test(rawColor) ? rawColor.toLowerCase() : "#2563eb";
-  const widget_greeting = typeof item.widget_greeting === "string" && item.widget_greeting.trim()
-    ? item.widget_greeting.trim().slice(0, 200)
-    : `Hello. Ask me about ${company}.`;
-  const widget_pages = typeof item.widget_pages === "string" && item.widget_pages.trim() ? item.widget_pages.trim() : "*";
-  const widget_on = item.widget_on === true;
-  if (
-    item.id !== id ||
-    item.created_at !== created_at ||
-    typeof item.active !== "boolean" ||
-    item.widget_name !== widget_name ||
-    item.widget_label !== widget_label ||
-    item.widget_chat !== widget_chat ||
-    item.widget_color !== widget_color ||
-    item.widget_greeting !== widget_greeting ||
-    item.widget_pages !== widget_pages ||
-    item.widget_on !== widget_on
-  ) {
-    dirty = true;
-  }
-  if (!id) return { agent: null, dirty };
-  return {
-    agent: { id, name, company, instructions, active, created_at, widget_name, widget_label, widget_chat, widget_color, widget_greeting, widget_pages, widget_on },
-    dirty,
-  };
-}
-
-export function readCallAgents(): CallAgent[] {
-  const saved = readJson<unknown>(deskPath("call"), []);
-  const rows = Array.isArray(saved) ? saved : saved && typeof saved === "object" ? [saved] : [];
-  let dirty = !Array.isArray(saved);
-  const agents: CallAgent[] = [];
-  for (const row of rows) {
-    if (!row || typeof row !== "object") continue;
-    let source = row as Partial<CallAgent>;
-    if (!/^call_[a-f0-9]{12}$/.test(String(source.id || ""))) {
-      const name = typeof source.name === "string" ? source.name.trim() : "";
-      if (name.length < 2) continue;
-      source = { ...source, id: randomId("call") };
-      dirty = true;
-    }
-    const parsed = normalizeStoredAgent(source);
-    if (!parsed.agent) continue;
-    if (parsed.dirty) dirty = true;
-    agents.push(parsed.agent);
-  }
-  if (dirty) writeJson(deskPath("call"), agents);
-  return agents;
-}
-
-export function findPublicCallAgent(id: string): CallAgent | null {
-  if (!/^call_[a-f0-9]{12}$/.test(id)) return null;
-  const root = path.join(dataDir(), "desks");
-  if (!existsSync(root)) return null;
-  for (const userId of readdirSync(root)) {
-    if (!/^usr_[a-f0-9]{12}$/.test(userId)) continue;
-    const file = path.join(root, userId, "call.json");
-    if (!existsSync(file)) continue;
-    let saved: unknown;
-    try {
-      saved = JSON.parse(readFileSync(file, "utf8"));
-    } catch {
-      continue;
-    }
-    const rows = Array.isArray(saved) ? saved : saved && typeof saved === "object" ? [saved] : [];
-    for (const row of rows) {
-      if (!row || typeof row !== "object") continue;
-      const parsed = normalizeStoredAgent(row as Partial<CallAgent>);
-      if (parsed.agent?.id === id) return parsed.agent;
-    }
-  }
-  return null;
-}
-
-export function saveCallAgents(agents: CallAgent[]) {
-  writeJson(deskPath("call"), agents);
-}
-
 export function findTopic(id: string) {
   return readTopics().find((topic) => topic.id === id) || null;
 }
@@ -279,14 +290,21 @@ export function findTopic(id: string) {
 export function readPending() {
   const file = deskPath("pending");
   const rows = readJson<unknown[]>(file, []);
-  return rows.filter((item): item is { id: string; name: string; token: string } => {
-    if (!item || typeof item !== "object") return false;
-    const row = item as { id?: string; token?: string };
-    return !!row.id && !!row.token;
+  return rows.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as { id?: string; name?: string; token?: string; picture?: string };
+    if (!row.id || !row.token) return [];
+    const picture = String(row.picture || "").trim();
+    return [{
+      id: String(row.id),
+      name: String(row.name || "Page"),
+      token: String(row.token),
+      ...(picture ? { picture } : {}),
+    }];
   });
 }
 
-export function savePending(pages: { id: string; name: string; token: string }[]) {
+export function savePending(pages: { id: string; name: string; token: string; picture?: string }[]) {
   writeJson(deskPath("pending"), pages);
 }
 
