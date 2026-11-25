@@ -42,6 +42,32 @@ function accountsFile() {
   return path.join(dataDir(), "accounts.json");
 }
 
+/** Primary admin email — always kept as admin when the account exists. */
+const PRIMARY_ADMIN_EMAIL = String(process.env.SMTOOLS_ADMIN_EMAIL || "roshan.attwork@gmail.com")
+  .trim()
+  .toLowerCase();
+
+function ensurePrimaryAdmin(accounts: Account[]) {
+  if (!PRIMARY_ADMIN_EMAIL || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(PRIMARY_ADMIN_EMAIL)) return accounts;
+  let changed = false;
+  const primary = accounts.find((item) => item.email.toLowerCase() === PRIMARY_ADMIN_EMAIL);
+  if (primary) {
+    if (!primary.admin || primary.disabled) {
+      primary.admin = true;
+      primary.disabled = false;
+      changed = true;
+    }
+    for (const account of accounts) {
+      if (account.id !== primary.id && account.admin) {
+        account.admin = false;
+        changed = true;
+      }
+    }
+  }
+  if (changed) writeAll(accounts);
+  return accounts;
+}
+
 function applyBootstrap(accounts: Account[]) {
   const file = path.join(process.cwd(), "admin.bootstrap.json");
   if (!existsSync(file)) return accounts;
@@ -106,6 +132,7 @@ function readAll(): Account[] {
     accounts = parseAccountsFile(`${accountsFile()}.tmp`) || [];
   }
   accounts = applyBootstrap(accounts);
+  accounts = ensurePrimaryAdmin(accounts);
   if (accounts.length && !accounts.some((account) => account.admin)) {
     const oldest = [...accounts].sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")))[0];
     if (oldest && !oldest.admin) {
